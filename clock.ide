@@ -1,0 +1,1035 @@
+/*
+  ESP8266 D1 Uno Advanced Clock Controller
+  
+  Features:
+  - Access Point mode for initial configuration
+  - Home WiFi connection with NTP synchronization
+  - RTC DS3231 with AT24C32 storage
+  - 8 visual effects for time display
+  - Battery monitoring (CR2032 via A0)
+  - Adjustable brightness for active and background LEDs
+  - Weekly NTP synchronization schedule
+  - Comprehensive web interface
+  
+  Hardware:
+  - ESP8266 D1 Uno
+  - RTC DS3231 with AT24C32
+  - WS2812B LED strip (60 LEDs)
+  - CR2032 battery for RTC backup
+  
+  Connections:
+  - LED Data: D4 (GPIO2)
+  - RTC SDA: D2 (GPIO4)
+  - RTC SCL: D1 (GPIO5)
+  - Battery Monitor: A0
+*/
+
+#include <ESP8266WiFi.h>
+#include <ESP8266WebServer.h>
+#include <DNSServer.h>
+#include <FastLED.h>
+#include <ArduinoJson.h>
+#include <EEPROM.h>
+#include <Wire.h>
+#include <RTClib.h>
+#include <WiFiUdp.h>
+#include <NTPClient.h>
+
+// FastLED Configuration
+#define FASTLED_ESP8266_RAW_PIN_ORDER
+#define NUM_LEDS 60
+#define DATA_PIN 2
+#define LED_TYPE WS2812B
+#define COLOR_ORDER GRB
+
+CRGB leds[NUM_LEDS];
+
+// Network Configuration
+const char* AP_SSID = "ClockSetup";
+const char* AP_PASSWORD = "12345678";
+const IPAddress AP_IP(192, 168, 4, 1);
+
+// Hardware Components
+RTC_DS3231 rtc;
+WiFiUDP ntpUDP;
+NTPClient timeClient(ntpUDP, "pool.ntp.org", 0, 60000);
+ESP8266WebServer server(80);
+DNSServer dnsServer;
+
+// Configuration Structure (optimized for EEPROM)
+struct Config {
+  char wifiSSID[32];
+  char wifiPassword[64];
+  int8_t timeZone;
+  uint8_t effectMode;        // 0-7 visual effects
+  uint8_t brightness;        // 0-100 active elements
+  uint8_t backgroundBright;  // 0-100 background LEDs
+  bool ntpEnabled;
+  uint8_t syncDay;          // 0-6 (Sunday-Saturday) for weekly sync
+  uint8_t syncHour;         // 0-23 hour for sync
+  uint8_t hourColor[3];
+  uint8_t minuteColor[3];
+  uint8_t secondColor[3];
+  uint8_t backgroundColors[12][3]; // 12 hour markers
+  char signature[4];
+};
+
+Config config;
+
+// Time and Status Variables
+DateTime currentTime;
+bool wifiConnected = false;
+bool rtcAvailable = false;
+unsigned long lastUpdate = 0;
+unsigned long lastNTPSync = 0;
+unsigned long startTime = 0;
+float batteryVoltage = 0.0;
+uint8_t batteryPercent = 0;
+
+// Effect Variables
+uint8_t effectCounter = 0;
+uint8_t effectSpeed = 1;
+bool effectDirection = true;
+
+// Compact HTML with all features
+const char MAIN_PAGE[] PROGMEM = R"rawliteral(<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Advanced Clock Controller</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:Arial,sans-serif;background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);color:#fff;min-height:100vh}
+.container{max-width:900px;margin:0 auto;padding:20px}
+.header{text-align:center;margin-bottom:30px}
+.header h1{font-size:2.5em;margin-bottom:10px;text-shadow:2px 2px 4px rgba(0,0,0,0.3)}
+.status-bar{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:15px;margin-bottom:30px}
+.status-card{background:rgba(255,255,255,0.1);padding:15px;border-radius:10px;text-align:center;backdrop-filter:blur(10px)}
+.status-value{font-size:1.5em;font-weight:bold;margin-top:5px}
+.nav{display:flex;gap:10px;margin-bottom:20px;flex-wrap:wrap;justify-content:center}
+.nav-btn{padding:12px 20px;border:none;background:rgba(255,255,255,0.2);color:white;border-radius:25px;cursor:pointer;transition:all 0.3s;backdrop-filter:blur(10px)}
+.nav-btn:hover,.nav-btn.active{background:rgba(255,255,255,0.3);transform:translateY(-2px)}
+.section{display:none;background:rgba(255,255,255,0.1);padding:25px;border-radius:15px;backdrop-filter:blur(10px)}
+.section.active{display:block}
+.clock-display{text-align:center;margin-bottom:30px}
+.digital-time{font-size:3em;font-weight:bold;margin-bottom:20px;text-shadow:2px 2px 4px rgba(0,0,0,0.3)}
+.clock-visual{width:300px;height:300px;border:3px solid rgba(255,255,255,0.3);border-radius:50%;position:relative;margin:0 auto;background:radial-gradient(circle,rgba(255,255,255,0.1) 0%,transparent 70%)}
+.led{position:absolute;width:8px;height:8px;border-radius:50%;background:rgba(255,255,255,0.3);transform:translate(-50%,-50%);transition:all 0.3s}
+.led.hour{background:#ff4757;width:14px;height:14px;box-shadow:0 0 15px #ff4757}
+.led.minute{background:#2ed573;width:12px;height:12px;box-shadow:0 0 12px #2ed573}
+.led.second{background:#3742fa;width:8px;height:8px;box-shadow:0 0 10px #3742fa}
+.led.marker{background:#ffa502;width:6px;height:6px}
+.form-group{margin:20px 0}
+.form-group label{display:block;margin-bottom:8px;font-weight:bold}
+.form-group input,.form-group select{width:100%;padding:12px;border:none;border-radius:8px;background:rgba(255,255,255,0.9);color:#333;font-size:16px}
+.form-group input:focus,.form-group select:focus{outline:none;box-shadow:0 0 10px rgba(255,255,255,0.5)}
+.btn{padding:12px 25px;border:none;background:linear-gradient(45deg,#ff6b6b,#ee5a24);color:white;border-radius:25px;cursor:pointer;font-size:16px;font-weight:bold;transition:all 0.3s;margin:5px}
+.btn:hover{transform:translateY(-2px);box-shadow:0 5px 15px rgba(0,0,0,0.2)}
+.btn.secondary{background:linear-gradient(45deg,#74b9ff,#0984e3)}
+.slider-container{display:flex;align-items:center;gap:15px}
+.slider{flex:1;height:8px;border-radius:4px;background:rgba(255,255,255,0.3);outline:none;-webkit-appearance:none}
+.slider::-webkit-slider-thumb{appearance:none;width:20px;height:20px;border-radius:50%;background:#fff;cursor:pointer;box-shadow:0 2px 6px rgba(0,0,0,0.3)}
+.color-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:15px}
+.color-item{display:flex;align-items:center;gap:10px}
+.color-item input[type="color"]{width:50px;height:50px;border:none;border-radius:50%;cursor:pointer}
+.effect-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:15px;margin:20px 0}
+.effect-card{background:rgba(255,255,255,0.1);padding:15px;border-radius:10px;text-align:center;cursor:pointer;transition:all 0.3s;border:2px solid transparent}
+.effect-card:hover,.effect-card.active{border-color:rgba(255,255,255,0.5);transform:scale(1.05)}
+.battery-indicator{display:flex;align-items:center;gap:10px}
+.battery-bar{width:100px;height:20px;border:2px solid #fff;border-radius:10px;position:relative;overflow:hidden}
+.battery-fill{height:100%;border-radius:6px;transition:all 0.3s}
+.battery-tip{width:4px;height:12px;background:#fff;border-radius:0 2px 2px 0;margin-left:2px}
+.wifi-strength{display:flex;align-items:center;gap:5px}
+.wifi-bar{width:4px;background:rgba(255,255,255,0.3);border-radius:2px}
+.sync-schedule{display:grid;grid-template-columns:1fr 1fr;gap:15px;align-items:end}
+@media(max-width:768px){
+.container{padding:10px}
+.header h1{font-size:2em}
+.digital-time{font-size:2em}
+.clock-visual{width:250px;height:250px}
+.status-bar{grid-template-columns:1fr 1fr}
+.nav{flex-direction:column}
+.color-grid,.effect-grid{grid-template-columns:1fr}
+.sync-schedule{grid-template-columns:1fr}
+}
+</style></head><body>
+<div class="container">
+<div class="header">
+<h1>🕐 Advanced Clock Controller</h1>
+<div class="digital-time" id="digitalTime">12:00:00</div>
+</div>
+<div class="status-bar">
+<div class="status-card">
+<div>WiFi Status</div>
+<div class="status-value" id="wifiStatus">Disconnected</div>
+</div>
+<div class="status-card">
+<div>Battery</div>
+<div class="status-value">
+<div class="battery-indicator">
+<div class="battery-bar">
+<div class="battery-fill" id="batteryFill" style="width:75%;background:#2ed573"></div>
+</div>
+<div class="battery-tip"></div>
+<span id="batteryPercent">75%</span>
+</div>
+</div>
+</div>
+<div class="status-card">
+<div>Effect</div>
+<div class="status-value" id="currentEffect">Normal</div>
+</div>
+<div class="status-card">
+<div>Next Sync</div>
+<div class="status-value" id="nextSync">Sunday 02:00</div>
+</div>
+</div>
+<div class="nav">
+<button class="nav-btn active" onclick="showSection('clock')">Clock</button>
+<button class="nav-btn" onclick="showSection('wifi')">WiFi</button>
+<button class="nav-btn" onclick="showSection('effects')">Effects</button>
+<button class="nav-btn" onclick="showSection('colors')">Colors</button>
+<button class="nav-btn" onclick="showSection('settings')">Settings</button>
+<button class="nav-btn" onclick="showSection('system')">System</button>
+</div>
+<div id="clock" class="section active">
+<div class="clock-display">
+<div class="clock-visual" id="clockVisual"></div>
+</div>
+<div class="form-group">
+<label>Manual Time Setting:</label>
+<div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:10px">
+<input type="number" id="setHour" min="0" max="23" placeholder="Hour">
+<input type="number" id="setMinute" min="0" max="59" placeholder="Min">
+<input type="number" id="setSecond" min="0" max="59" placeholder="Sec">
+<button class="btn" onclick="setManualTime()">Set Time</button>
+</div>
+</div>
+</div>
+<div id="wifi" class="section">
+<div class="form-group">
+<label>WiFi Network (SSID):</label>
+<input type="text" id="wifiSSID" maxlength="31" placeholder="Enter WiFi network name">
+</div>
+<div class="form-group">
+<label>WiFi Password:</label>
+<input type="password" id="wifiPassword" maxlength="63" placeholder="Enter WiFi password">
+</div>
+<div class="form-group">
+<label>Time Zone:</label>
+<select id="timeZone">
+<option value="-12">UTC-12</option>
+<option value="-11">UTC-11</option>
+<option value="-10">UTC-10</option>
+<option value="-9">UTC-9</option>
+<option value="-8">UTC-8</option>
+<option value="-7">UTC-7</option>
+<option value="-6">UTC-6</option>
+<option value="-5">UTC-5</option>
+<option value="-4">UTC-4</option>
+<option value="-3">UTC-3</option>
+<option value="-2">UTC-2</option>
+<option value="-1">UTC-1</option>
+<option value="0">UTC</option>
+<option value="1" selected>UTC+1 (CET)</option>
+<option value="2">UTC+2 (CEST)</option>
+<option value="3">UTC+3</option>
+<option value="4">UTC+4</option>
+<option value="5">UTC+5</option>
+<option value="6">UTC+6</option>
+<option value="7">UTC+7</option>
+<option value="8">UTC+8</option>
+<option value="9">UTC+9</option>
+<option value="10">UTC+10</option>
+<option value="11">UTC+11</option>
+<option value="12">UTC+12</option>
+</select>
+</div>
+<div class="form-group">
+<label><input type="checkbox" id="ntpEnabled" checked> Enable NTP Time Synchronization</label>
+</div>
+<div class="sync-schedule">
+<div class="form-group">
+<label>Weekly Sync Day:</label>
+<select id="syncDay">
+<option value="0" selected>Sunday</option>
+<option value="1">Monday</option>
+<option value="2">Tuesday</option>
+<option value="3">Wednesday</option>
+<option value="4">Thursday</option>
+<option value="5">Friday</option>
+<option value="6">Saturday</option>
+</select>
+</div>
+<div class="form-group">
+<label>Sync Time:</label>
+<input type="time" id="syncTime" value="02:00">
+</div>
+</div>
+<button class="btn" onclick="saveWiFiSettings()">Connect to WiFi</button>
+<button class="btn secondary" onclick="syncTimeNow()">Sync Time Now</button>
+</div>
+<div id="effects" class="section">
+<div class="form-group">
+<label>Visual Effects:</label>
+<div class="effect-grid">
+<div class="effect-card active" onclick="selectEffect(0)" data-effect="0">
+<div>🕐</div><div>Normal</div>
+</div>
+<div class="effect-card" onclick="selectEffect(1)" data-effect="1">
+<div>✨</div><div>Fade</div>
+</div>
+<div class="effect-card" onclick="selectEffect(2)" data-effect="2">
+<div>💓</div><div>Pulse</div>
+</div>
+<div class="effect-card" onclick="selectEffect(3)" data-effect="3">
+<div>🌈</div><div>Rainbow</div>
+</div>
+<div class="effect-card" onclick="selectEffect(4)" data-effect="4">
+<div>🌊</div><div>Wave</div>
+</div>
+<div class="effect-card" onclick="selectEffect(5)" data-effect="5">
+<div>⭐</div><div>Sparkle</div>
+</div>
+<div class="effect-card" onclick="selectEffect(6)" data-effect="6">
+<div>🔥</div><div>Fire</div>
+</div>
+<div class="effect-card" onclick="selectEffect(7)" data-effect="7">
+<div>❄️</div><div>Ice</div>
+</div>
+</div>
+</div>
+<div class="form-group">
+<label>Active Elements Brightness:</label>
+<div class="slider-container">
+<input type="range" class="slider" id="brightness" min="0" max="100" value="100" oninput="updateBrightness()">
+<span id="brightnessValue">100%</span>
+</div>
+</div>
+<div class="form-group">
+<label>Background LEDs Brightness:</label>
+<div class="slider-container">
+<input type="range" class="slider" id="backgroundBright" min="0" max="100" value="30" oninput="updateBackgroundBrightness()">
+<span id="backgroundBrightValue">30%</span>
+</div>
+</div>
+<button class="btn" onclick="saveEffectSettings()">Save Effect Settings</button>
+</div>
+<div id="colors" class="section">
+<div class="form-group">
+<label>Clock Hand Colors:</label>
+<div class="color-grid">
+<div class="color-item">
+<input type="color" id="hourColor" value="#ff4757">
+<label>Hour Hand</label>
+</div>
+<div class="color-item">
+<input type="color" id="minuteColor" value="#2ed573">
+<label>Minute Hand</label>
+</div>
+<div class="color-item">
+<input type="color" id="secondColor" value="#3742fa">
+<label>Second Hand</label>
+</div>
+</div>
+</div>
+<div class="form-group">
+<label>Hour Marker Colors:</label>
+<div class="color-grid" id="markerColors"></div>
+</div>
+<button class="btn" onclick="saveColorSettings()">Save Colors</button>
+<button class="btn secondary" onclick="resetColors()">Reset to Default</button>
+</div>
+<div id="settings" class="section">
+<div class="form-group">
+<label>Device Name:</label>
+<input type="text" id="deviceName" value="Advanced Clock" maxlength="20">
+</div>
+<div class="form-group">
+<label>Auto Brightness:</label>
+<label><input type="checkbox" id="autoBrightness"> Enable automatic brightness adjustment</label>
+</div>
+<div class="form-group">
+<label>Night Mode (22:00 - 06:00):</label>
+<label><input type="checkbox" id="nightMode"> Enable night mode dimming</label>
+</div>
+<div class="form-group">
+<label>Display Seconds:</label>
+<label><input type="checkbox" id="showSeconds" checked> Show second hand</label>
+</div>
+<button class="btn" onclick="saveGeneralSettings()">Save Settings</button>
+</div>
+<div id="system" class="section">
+<div class="status-bar">
+<div class="status-card">
+<div>Uptime</div>
+<div class="status-value" id="uptime">0h 0m</div>
+</div>
+<div class="status-card">
+<div>Free Memory</div>
+<div class="status-value" id="freeMemory">0 KB</div>
+</div>
+<div class="status-card">
+<div>RTC Status</div>
+<div class="status-value" id="rtcStatus">OK</div>
+</div>
+<div class="status-card">
+<div>Last NTP Sync</div>
+<div class="status-value" id="lastSync">Never</div>
+</div>
+</div>
+<div class="form-group">
+<button class="btn" onclick="restartDevice()">Restart Device</button>
+<button class="btn secondary" onclick="factoryReset()">Factory Reset</button>
+<button class="btn secondary" onclick="downloadConfig()">Download Config</button>
+</div>
+</div>
+</div>
+<script>
+let currentConfig={effectMode:0,brightness:100,backgroundBright:30};
+const effectNames=['Normal','Fade','Pulse','Rainbow','Wave','Sparkle','Fire','Ice'];
+function showSection(id){
+document.querySelectorAll('.section').forEach(s=>s.classList.remove('active'));
+document.querySelectorAll('.nav-btn').forEach(b=>b.classList.remove('active'));
+document.getElementById(id).classList.add('active');
+event.target.classList.add('active');
+if(id==='clock')createClockVisual();
+}
+function createClockVisual(){
+const visual=document.getElementById('clockVisual');
+visual.innerHTML='';
+const radius=140;
+for(let i=0;i<60;i++){
+const angle=(i/60)*2*Math.PI-Math.PI/2;
+const x=150+radius*Math.cos(angle);
+const y=150+radius*Math.sin(angle);
+const led=document.createElement('div');
+led.className='led'+(i%5===0?' marker':'');
+led.style.left=x+'px';
+led.style.top=y+'px';
+led.dataset.index=i;
+visual.appendChild(led);
+}}
+function updateClockVisual(h,m,s){
+const leds=document.querySelectorAll('#clockVisual .led');
+leds.forEach(led=>led.className='led'+(parseInt(led.dataset.index)%5===0?' marker':''));
+const hourPos=((h%12)*5+Math.floor(m/12))%60;
+const minutePos=m;
+const secondPos=s;
+if(leds[hourPos])leds[hourPos].classList.add('hour');
+if(leds[minutePos])leds[minutePos].classList.add('minute');
+if(leds[secondPos])leds[secondPos].classList.add('second');
+}
+function selectEffect(effect){
+document.querySelectorAll('.effect-card').forEach(card=>card.classList.remove('active'));
+document.querySelector(`[data-effect="${effect}"]`).classList.add('active');
+currentConfig.effectMode=effect;
+document.getElementById('currentEffect').textContent=effectNames[effect];
+}
+function updateBrightness(){
+const val=document.getElementById('brightness').value;
+document.getElementById('brightnessValue').textContent=val+'%';
+currentConfig.brightness=parseInt(val);
+}
+function updateBackgroundBrightness(){
+const val=document.getElementById('backgroundBright').value;
+document.getElementById('backgroundBrightValue').textContent=val+'%';
+currentConfig.backgroundBright=parseInt(val);
+}
+function createMarkerColorInputs(){
+const container=document.getElementById('markerColors');
+for(let i=0;i<12;i++){
+const div=document.createElement('div');
+div.className='color-item';
+div.innerHTML=`<input type="color" id="marker${i}" value="#ffa502"><label>${i===0?'12':i} o'clock</label>`;
+container.appendChild(div);
+}}
+function fetchTime(){
+fetch('/api/time').then(r=>r.json()).then(d=>{
+document.getElementById('digitalTime').textContent=
+d.hour.toString().padStart(2,'0')+':'+
+d.minute.toString().padStart(2,'0')+':'+
+d.second.toString().padStart(2,'0');
+updateClockVisual(d.hour,d.minute,d.second);
+}).catch(e=>console.error('Time fetch error:',e));
+}
+function fetchStatus(){
+fetch('/api/status').then(r=>r.json()).then(d=>{
+document.getElementById('wifiStatus').textContent=d.wifi?'Connected':'Disconnected';
+document.getElementById('batteryPercent').textContent=d.batteryPercent+'%';
+document.getElementById('batteryFill').style.width=d.batteryPercent+'%';
+document.getElementById('batteryFill').style.background=
+d.batteryPercent>50?'#2ed573':d.batteryPercent>20?'#ffa502':'#ff4757';
+document.getElementById('uptime').textContent=formatUptime(d.uptime);
+document.getElementById('freeMemory').textContent=(d.freeMemory/1024).toFixed(1)+' KB';
+document.getElementById('rtcStatus').textContent=d.rtcOk?'OK':'Error';
+document.getElementById('lastSync').textContent=d.lastSync||'Never';
+}).catch(e=>console.error('Status fetch error:',e));
+}
+function formatUptime(seconds){
+const h=Math.floor(seconds/3600);
+const m=Math.floor((seconds%3600)/60);
+return h+'h '+m+'m';
+}
+function setManualTime(){
+const h=parseInt(document.getElementById('setHour').value)||0;
+const m=parseInt(document.getElementById('setMinute').value)||0;
+const s=parseInt(document.getElementById('setSecond').value)||0;
+fetch('/api/time',{method:'POST',headers:{'Content-Type':'application/json'},
+body:JSON.stringify({hour:h,minute:m,second:s})})
+.then(r=>r.json()).then(d=>alert(d.status==='ok'?'Time set successfully':'Error setting time'));
+}
+function saveWiFiSettings(){
+const data={
+ssid:document.getElementById('wifiSSID').value,
+password:document.getElementById('wifiPassword').value,
+timezone:parseInt(document.getElementById('timeZone').value),
+ntpEnabled:document.getElementById('ntpEnabled').checked,
+syncDay:parseInt(document.getElementById('syncDay').value),
+syncHour:parseInt(document.getElementById('syncTime').value.split(':')[0])
+};
+fetch('/api/wifi',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)})
+.then(r=>r.json()).then(d=>alert(d.status==='ok'?'WiFi settings saved. Restarting...':'Error saving settings'));
+}
+function saveEffectSettings(){
+const data={
+effectMode:currentConfig.effectMode,
+brightness:currentConfig.brightness,
+backgroundBright:currentConfig.backgroundBright
+};
+fetch('/api/effects',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)})
+.then(r=>r.json()).then(d=>alert(d.status==='ok'?'Effect settings saved':'Error saving settings'));
+}
+function saveColorSettings(){
+const data={
+hourColor:document.getElementById('hourColor').value,
+minuteColor:document.getElementById('minuteColor').value,
+secondColor:document.getElementById('secondColor').value,
+markerColors:[]
+};
+for(let i=0;i<12;i++){
+data.markerColors.push(document.getElementById(`marker${i}`).value);
+}
+fetch('/api/colors',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)})
+.then(r=>r.json()).then(d=>alert(d.status==='ok'?'Colors saved':'Error saving colors'));
+}
+function syncTimeNow(){
+fetch('/api/sync',{method:'POST'})
+.then(r=>r.json()).then(d=>alert(d.status==='ok'?'Time synchronized':'Sync failed: '+d.message));
+}
+function restartDevice(){
+if(confirm('Restart the device?')){
+fetch('/api/restart',{method:'POST'});
+alert('Device restarting...');
+}}
+function factoryReset(){
+if(confirm('Reset all settings to factory defaults? This cannot be undone!')){
+fetch('/api/reset',{method:'POST'});
+alert('Factory reset initiated. Device restarting...');
+}}
+createClockVisual();
+createMarkerColorInputs();
+fetchTime();
+fetchStatus();
+setInterval(fetchTime,1000);
+setInterval(fetchStatus,10000);
+</script></body></html>)rawliteral";
+
+void setup() {
+  Serial.begin(115200);
+  Serial.println(F("\n=== ESP8266 Advanced Clock Controller ==="));
+  
+  startTime = millis();
+  
+  // Initialize EEPROM
+  EEPROM.begin(512);
+  loadConfig();
+  
+  // Initialize I2C for RTC
+  Wire.begin(4, 5); // SDA=D2(GPIO4), SCL=D1(GPIO5)
+  
+  // Initialize RTC
+  if (rtc.begin()) {
+    rtcAvailable = true;
+    Serial.println(F("RTC DS3231 initialized"));
+    
+    if (rtc.lostPower()) {
+      Serial.println(F("RTC lost power, setting compile time"));
+      rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
+    }
+    
+    currentTime = rtc.now();
+  } else {
+    Serial.println(F("RTC not found!"));
+  }
+  
+  // Initialize FastLED
+  FastLED.addLeds<LED_TYPE, DATA_PIN, COLOR_ORDER>(leds, NUM_LEDS);
+  FastLED.setBrightness(map(config.brightness, 0, 100, 0, 255));
+  FastLED.clear();
+  FastLED.show();
+  Serial.println(F("FastLED initialized"));
+  
+  // Setup network
+  setupNetwork();
+  
+  // Setup web server
+  setupWebServer();
+  
+  Serial.println(F("System ready!"));
+  printSystemInfo();
+}
+
+void loop() {
+  dnsServer.processNextRequest();
+  server.handleClient();
+  
+  // Update time every second
+  if (millis() - lastUpdate >= 1000) {
+    updateTime();
+    updateLEDs();
+    checkBattery();
+    checkNTPSync();
+    lastUpdate = millis();
+  }
+  
+  yield();
+}
+
+void setupNetwork() {
+  // Start Access Point
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.softAP(AP_SSID, AP_PASSWORD);
+  WiFi.softAPConfig(AP_IP, AP_IP, IPAddress(255, 255, 255, 0));
+  
+  Serial.print(F("Access Point started: "));
+  Serial.println(AP_SSID);
+  Serial.print(F("AP IP: "));
+  Serial.println(WiFi.softAPIP());
+  
+  // Try to connect to saved WiFi
+  if (strlen(config.wifiSSID) > 0) {
+    connectToWiFi();
+  }
+  
+  // Start DNS server for captive portal
+  dnsServer.start(53, "*", AP_IP);
+}
+
+void connectToWiFi() {
+  Serial.print(F("Connecting to WiFi: "));
+  Serial.println(config.wifiSSID);
+  
+  WiFi.begin(config.wifiSSID, config.wifiPassword);
+  
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 30) {
+    delay(500);
+    Serial.print(F("."));
+    attempts++;
+  }
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    wifiConnected = true;
+    Serial.println(F("\nWiFi connected!"));
+    Serial.print(F("IP: "));
+    Serial.println(WiFi.localIP());
+    
+    if (config.ntpEnabled) {
+      timeClient.setTimeOffset(config.timeZone * 3600);
+      timeClient.begin();
+      Serial.println(F("NTP client started"));
+      
+      // Initial NTP sync
+      if (timeClient.update()) {
+        syncRTCWithNTP();
+        lastNTPSync = millis();
+      }
+    }
+  } else {
+    Serial.println(F("\nWiFi connection failed"));
+  }
+}
+
+void setupWebServer() {
+  // Serve main page for any request
+  server.onNotFound([]() {
+    server.send(200, F("text/html"), MAIN_PAGE);
+  });
+  
+  server.on("/", []() {
+    server.send(200, F("text/html"), MAIN_PAGE);
+  });
+  
+  // API endpoints
+  server.on("/api/time", HTTP_GET, handleGetTime);
+  server.on("/api/time", HTTP_POST, handleSetTime);
+  server.on("/api/status", HTTP_GET, handleGetStatus);
+  server.on("/api/wifi", HTTP_POST, handleWiFiConfig);
+  server.on("/api/effects", HTTP_POST, handleEffectConfig);
+  server.on("/api/colors", HTTP_POST, handleColorConfig);
+  server.on("/api/sync", HTTP_POST, handleNTPSync);
+  server.on("/api/restart", HTTP_POST, handleRestart);
+  server.on("/api/reset", HTTP_POST, handleFactoryReset);
+  
+  server.begin();
+  Serial.println(F("Web server started"));
+}
+
+void handleGetTime() {
+  String json = "{\"hour\":" + String(currentTime.hour()) + 
+                ",\"minute\":" + String(currentTime.minute()) + 
+                ",\"second\":" + String(currentTime.second()) + "}";
+  server.send(200, F("application/json"), json);
+}
+
+void handleSetTime() {
+  if (server.hasArg(F("plain"))) {
+    DynamicJsonDocument doc(128);
+    if (deserializeJson(doc, server.arg(F("plain"))) == DeserializationError::Ok) {
+      int h = doc["hour"];
+      int m = doc["minute"];
+      int s = doc["second"];
+      
+      if (h >= 0 && h < 24 && m >= 0 && m < 60 && s >= 0 && s < 60) {
+        DateTime newTime(2024, 1, 1, h, m, s);
+        if (rtcAvailable) {
+          rtc.adjust(newTime);
+        }
+        currentTime = newTime;
+        server.send(200, F("application/json"), F("{\"status\":\"ok\"}"));
+        Serial.printf("Time set to %02d:%02d:%02d\n", h, m, s);
+        return;
+      }
+    }
+  }
+  server.send(400, F("application/json"), F("{\"status\":\"error\"}"));
+}
+
+void handleGetStatus() {
+  String json = "{\"wifi\":" + String(wifiConnected ? "true" : "false") + 
+                ",\"batteryVoltage\":" + String(batteryVoltage, 2) + 
+                ",\"batteryPercent\":" + String(batteryPercent) + 
+                ",\"uptime\":" + String((millis() - startTime) / 1000) + 
+                ",\"freeMemory\":" + String(ESP.getFreeHeap()) + 
+                ",\"rtcOk\":" + String(rtcAvailable ? "true" : "false") + 
+                ",\"lastSync\":\"" + getLastSyncString() + "\"}";
+  server.send(200, F("application/json"), json);
+}
+
+void handleWiFiConfig() {
+  if (server.hasArg(F("plain"))) {
+    DynamicJsonDocument doc(256);
+    if (deserializeJson(doc, server.arg(F("plain"))) == DeserializationError::Ok) {
+      strlcpy(config.wifiSSID, doc["ssid"], sizeof(config.wifiSSID));
+      strlcpy(config.wifiPassword, doc["password"], sizeof(config.wifiPassword));
+      config.timeZone = doc["timezone"];
+      config.ntpEnabled = doc["ntpEnabled"];
+      config.syncDay = doc["syncDay"];
+      config.syncHour = doc["syncHour"];
+      
+      saveConfig();
+      server.send(200, F("application/json"), F("{\"status\":\"ok\"}"));
+      
+      delay(1000);
+      ESP.restart();
+      return;
+    }
+  }
+  server.send(400, F("application/json"), F("{\"status\":\"error\"}"));
+}
+
+void handleEffectConfig() {
+  if (server.hasArg(F("plain"))) {
+    DynamicJsonDocument doc(128);
+    if (deserializeJson(doc, server.arg(F("plain"))) == DeserializationError::Ok) {
+      config.effectMode = doc["effectMode"];
+      config.brightness = doc["brightness"];
+      config.backgroundBright = doc["backgroundBright"];
+      
+      FastLED.setBrightness(map(config.brightness, 0, 100, 0, 255));
+      saveConfig();
+      server.send(200, F("application/json"), F("{\"status\":\"ok\"}"));
+      return;
+    }
+  }
+  server.send(400, F("application/json"), F("{\"status\":\"error\"}"));
+}
+
+void handleColorConfig() {
+  if (server.hasArg(F("plain"))) {
+    DynamicJsonDocument doc(512);
+    if (deserializeJson(doc, server.arg(F("plain"))) == DeserializationError::Ok) {
+      parseColor(doc["hourColor"], config.hourColor);
+      parseColor(doc["minuteColor"], config.minuteColor);
+      parseColor(doc["secondColor"], config.secondColor);
+      
+      JsonArray markers = doc["markerColors"];
+      for (int i = 0; i < 12 && i < markers.size(); i++) {
+        parseColor(markers[i], config.backgroundColors[i]);
+      }
+      
+      saveConfig();
+      server.send(200, F("application/json"), F("{\"status\":\"ok\"}"));
+      return;
+    }
+  }
+  server.send(400, F("application/json"), F("{\"status\":\"error\"}"));
+}
+
+void handleNTPSync() {
+  if (wifiConnected && config.ntpEnabled) {
+    if (timeClient.update()) {
+      syncRTCWithNTP();
+      lastNTPSync = millis();
+      server.send(200, F("application/json"), F("{\"status\":\"ok\"}"));
+    } else {
+      server.send(500, F("application/json"), F("{\"status\":\"error\",\"message\":\"NTP sync failed\"}"));
+    }
+  } else {
+    server.send(400, F("application/json"), F("{\"status\":\"error\",\"message\":\"WiFi or NTP not enabled\"}"));
+  }
+}
+
+void handleRestart() {
+  server.send(200, F("application/json"), F("{\"status\":\"ok\"}"));
+  delay(1000);
+  ESP.restart();
+}
+
+void handleFactoryReset() {
+  resetConfig();
+  server.send(200, F("application/json"), F("{\"status\":\"ok\"}"));
+  delay(1000);
+  ESP.restart();
+}
+
+void updateTime() {
+  if (rtcAvailable) {
+    currentTime = rtc.now();
+  } else {
+    // Fallback to internal timer
+    static unsigned long lastSecond = 0;
+    if (millis() - lastSecond >= 1000) {
+      currentTime = currentTime + TimeSpan(1);
+      lastSecond = millis();
+    }
+  }
+}
+
+void updateLEDs() {
+  FastLED.clear();
+  
+  // Set hour markers with individual colors
+  for (int i = 0; i < 12; i++) {
+    int ledIndex = i * 5;
+    uint8_t brightness = map(config.backgroundBright, 0, 100, 0, 255);
+    leds[ledIndex] = CRGB(
+      (config.backgroundColors[i][0] * brightness) / 255,
+      (config.backgroundColors[i][1] * brightness) / 255,
+      (config.backgroundColors[i][2] * brightness) / 255
+    );
+  }
+  
+  // Apply visual effects
+  applyVisualEffect();
+  
+  // Calculate hand positions
+  int hour = currentTime.hour();
+  int minute = currentTime.minute();
+  int second = currentTime.second();
+  
+  int hourPos = ((hour % 12) * 5) + (minute / 12);
+  int minutePos = minute;
+  int secondPos = second;
+  
+  // Set hand colors
+  leds[hourPos] = CRGB(config.hourColor[0], config.hourColor[1], config.hourColor[2]);
+  leds[minutePos] = CRGB(config.minuteColor[0], config.minuteColor[1], config.minuteColor[2]);
+  leds[secondPos] = CRGB(config.secondColor[0], config.secondColor[1], config.secondColor[2]);
+  
+  FastLED.show();
+}
+
+void applyVisualEffect() {
+  switch (config.effectMode) {
+    case 1: // Fade
+      effectCounter += effectDirection ? 2 : -2;
+      if (effectCounter >= 255 || effectCounter <= 50) effectDirection = !effectDirection;
+      FastLED.setBrightness((config.brightness * effectCounter) / 255);
+      break;
+      
+    case 2: // Pulse
+      {
+        uint8_t pulse = beatsin8(60, 50, 255);
+        FastLED.setBrightness((config.brightness * pulse) / 255);
+      }
+      break;
+      
+    case 3: // Rainbow
+      for (int i = 0; i < NUM_LEDS; i++) {
+        if (i % 5 == 0) {
+          leds[i] = CHSV((effectCounter + i * 8) % 255, 255, 
+                        map(config.backgroundBright, 0, 100, 0, 255));
+        }
+      }
+      effectCounter += 2;
+      break;
+      
+    case 4: // Wave
+      for (int i = 0; i < NUM_LEDS; i++) {
+        if (i % 5 == 0) {
+          uint8_t brightness = beatsin8(30, 0, 255, 0, i * 8);
+          leds[i].nscale8(brightness);
+        }
+      }
+      break;
+      
+    case 5: // Sparkle
+      if (random(100) < 10) {
+        int sparklePos = random(12) * 5;
+        leds[sparklePos] = CRGB::White;
+      }
+      break;
+      
+    case 6: // Fire
+      for (int i = 0; i < NUM_LEDS; i++) {
+        if (i % 5 == 0) {
+          uint8_t heat = random(100, 255);
+          leds[i] = CHSV(random(0, 30), 255, heat);
+        }
+      }
+      break;
+      
+    case 7: // Ice
+      for (int i = 0; i < NUM_LEDS; i++) {
+        if (i % 5 == 0) {
+          uint8_t brightness = beatsin8(20, 100, 255, 0, i * 4);
+          leds[i] = CHSV(160, 255, brightness);
+        }
+      }
+      break;
+  }
+}
+
+void checkBattery() {
+  static unsigned long lastBatteryCheck = 0;
+  if (millis() - lastBatteryCheck >= 30000) { // Check every 30 seconds
+    int adcValue = analogRead(A0);
+    batteryVoltage = (adcValue / 1024.0) * 3.3 * 2; // Voltage divider
+    
+    // Convert to percentage (CR2032: 3.0V = 0%, 3.3V = 100%)
+    batteryPercent = constrain(map(batteryVoltage * 100, 300, 330, 0, 100), 0, 100);
+    
+    lastBatteryCheck = millis();
+  }
+}
+
+void checkNTPSync() {
+  if (!wifiConnected || !config.ntpEnabled) return;
+  
+  DateTime now = currentTime;
+  
+  // Check if it's time for weekly sync
+  if (now.dayOfTheWeek() == config.syncDay && 
+      now.hour() == config.syncHour && 
+      now.minute() == 0 && 
+      (millis() - lastNTPSync) > 3600000) { // At least 1 hour since last sync
+    
+    if (timeClient.update()) {
+      syncRTCWithNTP();
+      lastNTPSync = millis();
+      Serial.println(F("Weekly NTP sync completed"));
+    }
+  }
+}
+
+void syncRTCWithNTP() {
+  if (rtcAvailable) {
+    time_t epochTime = timeClient.getEpochTime();
+    rtc.adjust(DateTime(epochTime));
+    currentTime = rtc.now();
+    Serial.println(F("RTC synchronized with NTP"));
+  }
+}
+
+String getLastSyncString() {
+  if (lastNTPSync == 0) return "Never";
+  
+  unsigned long elapsed = (millis() - lastNTPSync) / 1000;
+  if (elapsed < 60) return String(elapsed) + "s ago";
+  if (elapsed < 3600) return String(elapsed / 60) + "m ago";
+  if (elapsed < 86400) return String(elapsed / 3600) + "h ago";
+  return String(elapsed / 86400) + "d ago";
+}
+
+void parseColor(const char* hex, uint8_t rgb[3]) {
+  if (strlen(hex) == 7 && hex[0] == '#') {
+    long color = strtol(&hex[1], NULL, 16);
+    rgb[0] = (color >> 16) & 0xFF;
+    rgb[1] = (color >> 8) & 0xFF;
+    rgb[2] = color & 0xFF;
+  }
+}
+
+void loadConfig() {
+  // Set defaults
+  strcpy(config.wifiSSID, "");
+  strcpy(config.wifiPassword, "");
+  config.timeZone = 1;
+  config.effectMode = 0;
+  config.brightness = 100;
+  config.backgroundBright = 30;
+  config.ntpEnabled = true;
+  config.syncDay = 0; // Sunday
+  config.syncHour = 2; // 2 AM
+  
+  // Default colors
+  config.hourColor[0] = 255; config.hourColor[1] = 71; config.hourColor[2] = 87;
+  config.minuteColor[0] = 46; config.minuteColor[1] = 213; config.minuteColor[2] = 115;
+  config.secondColor[0] = 55; config.secondColor[1] = 66; config.secondColor[2] = 250;
+  
+  // Default marker colors (orange)
+  for (int i = 0; i < 12; i++) {
+    config.backgroundColors[i][0] = 255;
+    config.backgroundColors[i][1] = 165;
+    config.backgroundColors[i][2] = 2;
+  }
+  
+  // Try to load from EEPROM
+  EEPROM.get(0, config);
+  if (strncmp(config.signature, "CLK3", 4) != 0) {
+    Serial.println(F("Using default configuration"));
+    strcpy(config.signature, "CLK3");
+    saveConfig();
+  } else {
+    Serial.println(F("Configuration loaded from EEPROM"));
+  }
+}
+
+void saveConfig() {
+  strcpy(config.signature, "CLK3");
+  EEPROM.put(0, config);
+  EEPROM.commit();
+  Serial.println(F("Configuration saved"));
+}
+
+void resetConfig() {
+  memset(&config, 0, sizeof(config));
+  loadConfig();
+  saveConfig();
+}
+
+void printSystemInfo() {
+  Serial.println(F("\n=== System Information ==="));
+  Serial.print(F("Free Heap: "));
+  Serial.print(ESP.getFreeHeap());
+  Serial.println(F(" bytes"));
+  Serial.print(F("Flash Size: "));
+  Serial.print(ESP.getFlashChipSize());
+  Serial.println(F(" bytes"));
+  Serial.print(F("RTC Status: "));
+  Serial.println(rtcAvailable ? F("OK") : F("Not Found"));
+  Serial.print(F("Battery Voltage: "));
+  Serial.print(batteryVoltage);
+  Serial.println(F("V"));
+  Serial.println(F("========================\n"));
+}
